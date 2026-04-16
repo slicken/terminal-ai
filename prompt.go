@@ -70,9 +70,6 @@ func buildInteractivePrompt() (display string, style promptStyle) {
 
 // labelPromptANSI returns open/close ANSI around the label and the tail ":path$ " with colors.
 func labelPromptANSI(shortWd string) (open, close, after string) {
-	if os.Getenv("NO_COLOR") != "" {
-		return "", "", ":" + shortWd + "$ "
-	}
 	// Green bold label, white :, blue path, white $ — similar to common distro prompts.
 	open = "\033[1;32m"
 	close = "\033[0m"

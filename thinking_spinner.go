@@ -3,7 +3,6 @@ package main
 import (
 	"fmt"
 	"os"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -44,22 +43,9 @@ func stderrIsTTY() bool {
 	return term.IsTerminal(int(os.Stderr.Fd()))
 }
 
-func stderrColorEnabled() bool {
-	return stderrIsTTY() && os.Getenv("NO_COLOR") == ""
-}
-
-// legacySpinnerPrefixRunes: only used when TERMINAL_AI_PROMPT is a legacy %w template.
-func legacySpinnerPrefixRunes() int {
-	s := strings.TrimSpace(os.Getenv("TERMINAL_AI_SPINNER_PREFIX_RUNES"))
-	if s == "" {
-		return 12
-	}
-	n, err := strconv.Atoi(s)
-	if err != nil || n < 0 {
-		return 12
-	}
-	return n
-}
+// legacySpinnerPrefixVisibleRunes is how many visible runes at the start of the legacy expanded
+// prompt count as the prefix before the [thinking] segment (ANSI escapes are not counted).
+const legacySpinnerPrefixVisibleRunes = 12
 
 func skipEscapeSeq(b []byte, start int) int {
 	if start >= len(b) || b[start] != 0x1b {
@@ -170,7 +156,7 @@ func startLabelSpinner(style promptStyle, userDisplay string) (stop func()) {
 			if !inline {
 				return
 			}
-			if stderrColorEnabled() && (style.LabelOpen != "" || style.LabelClose != "") {
+			if stderrIsTTY() && (style.LabelOpen != "" || style.LabelClose != "") {
 				fmt.Fprintf(os.Stderr, "\r%s%s%s%s%s\033[K",
 					style.LabelOpen, frame, style.LabelClose, style.AfterLabel, userDisplay)
 			} else {
@@ -205,7 +191,7 @@ func startLabelSpinner(style promptStyle, userDisplay string) (stop func()) {
 
 func startLegacyTemplateSpinner(expandedPrompt, userDisplay string) (stop func()) {
 	inline := userDisplay != "" && strings.TrimSpace(expandedPrompt) != ""
-	n := legacySpinnerPrefixRunes()
+	n := legacySpinnerPrefixVisibleRunes
 	promptSuffix := promptSuffixAfterVisualPrefix(expandedPrompt, n)
 
 	frames := GetSpinner()
@@ -231,7 +217,7 @@ func startLegacyTemplateSpinner(expandedPrompt, userDisplay string) (stop func()
 			inner := pad(frames[i%len(frames)])
 			i++
 			if inline {
-				if stderrColorEnabled() {
+				if stderrIsTTY() {
 					fmt.Fprintf(os.Stderr, "\r\033[2;37m[\033[0m\033[1;38;5;214m%s\033[0m\033[2;37m]\033[0m%s%s\033[K",
 						inner, promptSuffix, userDisplay)
 				} else {
@@ -239,7 +225,7 @@ func startLegacyTemplateSpinner(expandedPrompt, userDisplay string) (stop func()
 				}
 				return
 			}
-			if stderrColorEnabled() {
+			if stderrIsTTY() {
 				fmt.Fprintf(os.Stderr, "\r\033[2;37m[\033[0m\033[1;38;5;214m%s\033[0m\033[2;37m]\033[0m\033[K", inner)
 			} else {
 				fmt.Fprintf(os.Stderr, "\r[%s]\033[K", inner)
@@ -293,7 +279,7 @@ func startAskLineSpinner() (stop func()) {
 		printFrame := func() {
 			inner := pad(frames[i%len(frames)])
 			i++
-			if stderrColorEnabled() {
+			if stderrIsTTY() {
 				fmt.Fprintf(os.Stderr, "\r\033[2;37m[\033[0m\033[1;38;5;214m%s\033[0m\033[2;37m]\033[0m\033[K", inner)
 			} else {
 				fmt.Fprintf(os.Stderr, "\r[%s]\033[K", inner)

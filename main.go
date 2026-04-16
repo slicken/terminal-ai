@@ -50,7 +50,6 @@ Environment:
                        Go-style escapes: \\e = ESC, \\x1b, \\n, etc. Default is \\ep (Alt+P on xterm-like terminals).
   TERMINAL_AI_SHELL_LINE  optional full line to redraw when canceling (overwrites the app prompt row; no extra newline).
   TERMINAL_AI_EXPAND_PS1  if unset or 1, runs bash to expand PS1 (${PS1@P}) for redraw; set 0 to skip.
-  TERMINAL_AI_SPINNER_PREFIX_RUNES  legacy templates only: visible runes before [thinking] (default 12).
 `)
 }
 
@@ -102,9 +101,12 @@ func runInteractive() int {
 
 	tty, err := openDevTTY()
 	var input *os.File
+	needExitSyncNewline := true
 	if err == nil && tty != nil {
 		defer func() {
-			sttySaneOn(tty)
+			repairTTYLineDiscipline(tty)
+			announceTTYReadyForReadline(tty)
+			syncReadlineWithNewline(needExitSyncNewline)
 			tty.Close()
 		}()
 		sttySaneOn(tty)
@@ -114,13 +116,20 @@ func runInteractive() int {
 			fmt.Fprintf(os.Stderr, "terminal-ai: stdin is not a terminal; use: terminal-ai ask ...\n")
 			return 2
 		}
-		defer func() { sttySaneOn(os.Stdin) }()
+		defer func() {
+			repairTTYLineDiscipline(os.Stdin)
+			announceTTYReadyForReadline(os.Stdout)
+			syncReadlineWithNewline(needExitSyncNewline)
+		}()
 		sttySaneOn(os.Stdin)
 		input = os.Stdin
 	}
 
 	line, altPCancel, err := readInteractiveLine(input, prompt)
 	if altPCancel {
+		// writeShellRestore already repainted PS1 on the same row; an extra \n from syncReadlineWithNewline
+		// would move the cursor down and show the shell prompt on a new line (wrong for bind -x toggle).
+		needExitSyncNewline = false
 		return 0
 	}
 	if err != nil {
@@ -133,9 +142,15 @@ func runInteractive() int {
 	rawLine := line
 	line = strings.TrimSpace(line)
 	if line == "" {
+		// Enter on an empty line already sent \r\n in readInteractiveLine; do not add another.
+		needExitSyncNewline = false
 		return 0
 	}
-	return runQuery(line, pstyle, rawLine)
+	code := runQuery(line, pstyle, rawLine)
+	if code == 0 {
+		needExitSyncNewline = false
+	}
+	return code
 }
 
 func runAsk(argv []string) int {
@@ -176,7 +191,9 @@ func runQuery(query string, style promptStyle, userDisplay string) int {
 	}
 
 	out, err := exec.Command("sh", "-c", cmdStr).CombinedOutput()
-	out = []byte(strings.TrimRight(string(out), "\n"))
+	s := strings.TrimRight(string(out), "\n\r")
+	s = strings.TrimLeft(s, "\n\r")
+	out = []byte(s)
 	if err != nil {
 		if len(out) > 0 {
 			fmt.Fprintf(os.Stderr, "%s\n", out)

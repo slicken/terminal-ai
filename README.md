@@ -1,15 +1,13 @@
 # terminal-ai
 
-**terminal-ai** is a small, **lightweight** helper for your terminal: you get a short **prompt**, describe what you want in plain language, and it turns that into a **Linux shell command**, runs it with `sh -c`, and shows the output. Use it when you forget flags, pipeline order, or the right tool—without leaving the shell or opening a full-screen app.
+**terminal-ai** is a small **lightweight** helper for your terminal: it prints a **prompt**, you type what you want in plain language, it asks an **Ollama** model for **one** shell command, runs it with `sh -c`, prints combined stdout/stderr, then exits so your normal shell prompt returns.
 
-It talks to a local or cloud **Ollama** model, suggests **one** command at a time, then exits so your normal shell prompt returns.
-
-**Interactive mode** (the default) prints a prompt, reads **one** line, runs the workflow above, and quits. Map a **hotkey** (e.g. **Alt+P** via your terminal or Bash `bind -x`) to `terminal-ai`, or run `./terminal-ai` whenever you need it.
+**Interactive mode** (the default) reads **one** line, runs that workflow, and quits. Map a **hotkey** (e.g. **Alt+P** via your terminal or Bash `bind -x`) to the **binary**, or run `terminal-ai` when you need it.
 
 ## Requirements
 
 - **Go** (to build)
-- **Ollama**: local server and model, *or* [Ollama Cloud](https://ollama.com) with an API key
+- **Ollama**: local HTTP API and model, or [Ollama Cloud](https://ollama.com) with an API key
 
 ## Build and install
 
@@ -18,79 +16,92 @@ cd /path/to/terminal-ai
 go build -o terminal-ai .
 ```
 
-Put the binary on your `PATH`, or configure your terminal shortcut with the full path.
+Put the binary on your `PATH`, or point your hotkey at the **file** (not the project directory), e.g. `/path/to/terminal-ai/terminal-ai`.
 
 ## CLI
 
 ```bash
 terminal-ai                          # interactive: one line, then exit
 terminal-ai interactive              # same
-terminal-ai ask list files here      # non-interactive (no prompt)
-terminal-ai ask < file.txt           # query from stdin (whole file / stream)
+terminal-ai ask list files here    # non-interactive; query from arguments
+terminal-ai ask                      # non-interactive; query from stdin if no args
 terminal-ai help
+terminal-ai -h                       # same as help
+terminal-ai --help
 ```
 
 ## Prompt modes (`TERMINAL_AI_PROMPT`)
 
 ### Default (label mode)
 
-If **`TERMINAL_AI_PROMPT`** does **not** contain **`%w`**, **`%u`**, or **`%h`**, the value is treated as a **short label** only (like `user@host` in a normal prompt). The app builds a line in the style **`Label:path$ `**:
+If **`TERMINAL_AI_PROMPT`** does **not** contain **`%w`**, **`%u`**, or **`%h`**, the env var is **only the short label** — the text that stands where **`user@host`** would be in a normal prompt (e.g. **`TerminalAI`** or **`MyAI`**).
 
-- **Label** — from the env var; if unset or empty, **`TerminalAI`**
-- **Path** — current working directory with `~` when under `$HOME`
-- **Colors** (unless **`NO_COLOR`** is set): bold green label, white `:`, bold blue path, white `$` and a trailing space
+The app **always** builds the rest of the line itself: **`:path$ `** — current directory with **`~`** under **`$HOME`**, the **`$`**, spacing, and ANSI styling. You **do not** set **`:~/…$`** (or the colon, path, or dollar) via this variable in label mode.
 
-Example with a custom label:
+| Part | Source |
+|------|--------|
+| **Label** (`user@host` stand-in) | **`TERMINAL_AI_PROMPT`**; if unset or empty, **`TerminalAI`** |
+| **`:path$ `** (colon, cwd, dollar, colors) | **Built by the app** — not from the env value |
+
+Example:
 
 ```bash
 export TERMINAL_AI_PROMPT=MyAI
-# Renders like: MyAI:~/project$ 
+# Renders like: MyAI:~/project$
 ```
 
-While the model is **thinking**, a **wave animation** runs **in the label area** (same colors as the label); **`:path$ `** and your typed text stay on the same row.
+While the model runs, a **spinner** replaces **only the label** on that row; **`:path$ `** and what you typed stay visible.
 
 ### Legacy (full template)
 
-If the value **contains** **`%w`**, **`%u`**, or **`%h`**, **full template mode** is used (previous behavior): the string is expanded and printed as-is.
+If the value **contains** **`%w`**, **`%u`**, or **`%h`**, **legacy template mode** is used: **your string is the entire prompt line** (after expansion). You place **`%w`**, **`%u`**, **`%h`** wherever you want in that line — including where the directory appears — and you can add your own ANSI, spacing, and prompt character. This is **not** the same as label mode: the app does **not** append a separate **`:path$ `** block; the expanded template **is** what gets shown.
 
 | Placeholder | Replaced with |
 |-------------|----------------|
-| **`%w`** | Current directory, `~` for home |
+| **`%w`** | Current directory, `~` under `$HOME` |
 | **`%u`** | **`$USER`** |
 | **`%h`** | Short hostname (segment before first `.`) |
 | **`%%`** | A literal **`%`** |
 
-In this mode the thinking indicator uses a **`[wave]`**-style segment and **`TERMINAL_AI_SPINNER_PREFIX_RUNES`** (default **12**) controls how many **visible** characters at the start of the expanded prompt count as the “prefix” before that segment (ANSI escape sequences are not counted).
+In this mode the thinking line shows a **`[ … ]`**-style segment after the **first 12 visible characters** of the expanded prompt (ANSI escapes are not counted toward that 12).
+
+Example (legacy — **full line** is your template):
+
+```bash
+export TERMINAL_AI_PROMPT='%u@%h:%w$ '
+terminal-ai
+```
 
 ## Environment variables
 
 | Variable | Purpose | Default |
 |----------|---------|---------|
-| **`OLLAMA_HOST`** | Base URL of your **local** Ollama HTTP API (no trailing slash). Ignored when **`OLLAMA_API_KEY`** is set. | `http://127.0.0.1:11434` |
-| **`OLLAMA_MODEL`** | Model name passed to `/api/generate`. | `gemma4:e2b` |
-| **`OLLAMA_API_KEY`** | If set (non-empty), requests go to **`https://ollama.com/api/generate`** (Ollama Cloud) with `Authorization: Bearer …`. | *(unset → local server)* |
-| **`TERMINAL_AI_PROMPT`** | **Label mode:** short name (e.g. `TerminalAI`). **Legacy:** full template with **`%w`** / **`%u`** / **`%h`** / **`%%`**. | Label **`TerminalAI`** when unset |
-| **`TERMINAL_AI_HOTKEY`** | Byte sequence that **cancels** interactive input (toggle back to the shell). Go-style escapes: **`\e`** = ESC, **`\xNN`**, etc. | **`\\ep`** (ESC then `p`, typical **Alt+P** on xterm-like terminals) |
-| **`TERMINAL_AI_SHELL_LINE`** | If set, this **exact** string is redrawn on the same row when you cancel with the hotkey (optional; see below). | *(unset)* |
-| **`TERMINAL_AI_EXPAND_PS1`** | If unset or **`1`**, cancel redraw tries **`bash -c 'printf %s "${PS1@P}"'`** to repaint the shell prompt. Set **`0`** to skip. | on |
-| **`TERMINAL_AI_SPINNER_PREFIX_RUNES`** | **Legacy prompts only:** visible runes counted from the start of the expanded prompt before the **`[thinking]`** block. | `12` |
-| **`NO_COLOR`** | If set, disables ANSI colors in the default label prompt and spinners. | *(unset)* |
+| **`OLLAMA_HOST`** | Base URL of the **local** Ollama HTTP API (no trailing slash). Not used when **`OLLAMA_API_KEY`** is set. | `http://127.0.0.1:11434` |
+| **`OLLAMA_MODEL`** | Model name for `/api/generate`. | `gemma4:e2b` |
+| **`OLLAMA_API_KEY`** | If set (non-empty), requests go to **Ollama Cloud** at `https://ollama.com/api/generate` with `Authorization: Bearer …`. | *(unset → local server)* |
+| **`TERMINAL_AI_PROMPT`** | **Label mode:** label only (like `user@host`); app adds **`:path$ `**. **Legacy** (if value contains **`%w`** / **`%u`** / **`%h`**): **full-line** template with placeholders. | Label **`TerminalAI`** when unset |
+| **`TERMINAL_AI_HOTKEY`** | Raw byte sequence that **cancels** interactive input (return to the shell). Go-style escapes: **`\e`** = ESC, **`\xNN`**, etc. | **`\\ep`** (ESC then **`p`**, typical **Alt+P** on xterm-like terminals) |
+| **`TERMINAL_AI_SHELL_LINE`** | If set, this exact string is redrawn on **the same row** when you cancel (optional). | *(unset)* |
+| **`TERMINAL_AI_EXPAND_PS1`** | If unset or **`1`**, cancel redraw uses **`bash -c 'printf %s "${PS1@P}"'`** when **`TERMINAL_AI_SHELL_LINE`** is unset. Set **`0`** to skip. | on |
 
-**Legacy colored prompt** example (full control via placeholders):
+## Hotkey, Escape, and Bash `bind -x`
+
+**Terminal / WM shortcut:** bind your key to the **terminal-ai binary** (full path is safest).
+
+**Cancel from inside the app:**
+
+- The configured hotkey (default **Alt+P**, i.e. ESC then **`p`**) returns to the shell and, when possible, redraws your shell prompt on the **same line** as the app prompt.
+- **Escape** alone also cancels: the program waits briefly for a possible second byte (so **Alt+P** still works when ESC and **`p`** arrive separately), then exits like a full hotkey cancel.
+
+**Bash `bind -x`:** after the handler runs, readline sometimes needs the same effect as **Enter** on a new line. This program writes a newline to **`/dev/tty`** when exiting interactive mode **only when** that extra line is still needed (it is skipped when you cancel with the hotkey, submit an empty line, or finish a successful run that already printed a trailing newline). You can also reset the edit line in the binding:
 
 ```bash
-export TERMINAL_AI_PROMPT=$'\033[1;33m%u\033[0m@\033[1;32m%h\033[0m \033[1;34m%w\033[0m [ai]\$ '
-terminal-ai
+bind -x '"\ep":"/path/to/terminal-ai/terminal-ai; READLINE_LINE=; READLINE_POINT=0"'
 ```
 
-## Hotkey and cancel
-
-**Terminal shortcut:** map **Alt+P** (or any key) to `terminal-ai` or `/path/to/terminal-ai`.
-
-**Bash `bind -x`:**
+Wrapper example (set **`TERMINAL_AI_BIN`** to your binary path):
 
 ```bash
-export TERMINAL_AI_BIN=/path/to/terminal-ai
 terminal_ai_run() {
   "$TERMINAL_AI_BIN"
   READLINE_LINE=
@@ -99,21 +110,21 @@ terminal_ai_run() {
 bind -x '"\ep":"terminal_ai_run"'
 ```
 
-Configure the same sequence with **`TERMINAL_AI_HOTKEY`** (default **`\\ep`**) so cancel matches your binding.
+Use the **same** key sequence in **`TERMINAL_AI_HOTKEY`** as in **`bind -x`** so cancel in raw input matches your shell binding.
 
-On cancel, the app restores the TTY to **cooked** mode, runs **`stty sane`** on **`/dev/tty`** (or stdin), then optionally redraws your shell line: **`TERMINAL_AI_SHELL_LINE`** if set, otherwise expanded **`${PS1@P}`** via bash when **`TERMINAL_AI_EXPAND_PS1`** is not **`0`**.
+On cancel, the app restores **cooked** TTY mode, runs **`stty sane`** on **`/dev/tty`** and on **stdin** when they differ, then redraws: **`TERMINAL_AI_SHELL_LINE`** if set, otherwise expanded **`${PS1@P}`** via bash when **`TERMINAL_AI_EXPAND_PS1`** is not **`0`**.
 
-Interactive mode opens **`/dev/tty`** when possible and runs **`stty sane`** on startup (Unix) so typing works after **`bind -x`**.
+Interactive mode opens **`/dev/tty`** when possible (Unix) and runs **`stty sane`** on startup so input works after **`bind -x`**.
 
 ## Security
 
-The model may suggest **any** shell command; the tool runs it under **`sh -c`**. Only use models and hosts you trust, and avoid pasting sensitive data into prompts.
+The model may suggest **any** shell command; the tool runs it under **`sh -c`**. Use trusted models and hosts, and avoid pasting secrets into prompts.
 
 ## Example
 
 ![terminal-ai interactive prompt and output](terminal-ai.png)
 
-Place **`terminal-ai.png`** in the **repository root** next to this README (same folder as `go.mod`) so the image loads on GitHub and in editors that render relative paths.
+Put **`terminal-ai.png`** in the **repository root** next to this README so the image resolves on GitHub and in editors.
 
 ## License
 

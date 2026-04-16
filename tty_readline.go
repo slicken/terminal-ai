@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -13,6 +14,10 @@ import (
 
 	"golang.org/x/term"
 )
+
+// loneESCHotkeyPoll is how long we wait for the rest of TERMINAL_AI_HOTKEY after a leading ESC
+// before treating the key as a lone Escape (cancel), so the input loop does not block forever.
+const loneESCHotkeyPoll = 100 * time.Millisecond
 
 // terminalAIHotkey returns the raw byte sequence for TERMINAL_AI_HOTKEY (toggle / cancel).
 // Default is "\ep" (ESC then p, i.e. typical Alt+P). Empty env uses that default.
@@ -109,6 +114,50 @@ func writeShellRestore(tty *os.File, restoreLine string) {
 	_ = tty.Sync()
 }
 
+// repairTTYLineDiscipline runs stty sane on the session tty and, when it differs from stdin, on stdin too.
+// Bash/readline can keep separate fds; after raw mode both must be sane or the next Meta key echoes as ^[p.
+func repairTTYLineDiscipline(tty *os.File) {
+	if tty == nil {
+		return
+	}
+	sttySaneOn(tty)
+	stdinFd := int(os.Stdin.Fd())
+	ttyFd := int(tty.Fd())
+	if stdinFd != ttyFd && term.IsTerminal(stdinFd) {
+		sttySaneOn(os.Stdin)
+	}
+}
+
+// announceTTYReadyForReadline resets common private modes so readline/bind handle the next keypress.
+func announceTTYReadyForReadline(w io.Writer) {
+	f, ok := w.(*os.File)
+	if !ok || f == nil || !term.IsTerminal(int(f.Fd())) {
+		return
+	}
+	_, _ = io.WriteString(f, "\033[?25h\033[?2004l") // show cursor; disable bracketed paste if stuck on
+	_ = f.Sync()
+}
+
+// syncReadlineWithNewline sends a newline to the controlling tty so Bash readline accepts a line after
+// bind -x (same effect as pressing Enter once).
+// If needExtra is false, skip writing: e.g. successful runQuery already printed a trailing newline;
+// hotkey cancel already used writeShellRestore on the same row; empty input already sent \r\n.
+func syncReadlineWithNewline(needExtra bool) {
+	if !needExtra {
+		return
+	}
+	f, err := os.OpenFile("/dev/tty", os.O_WRONLY, 0)
+	if err != nil {
+		if term.IsTerminal(int(os.Stdout.Fd())) {
+			_, _ = fmt.Fprint(os.Stdout, "\n")
+		}
+		return
+	}
+	defer f.Close()
+	_, _ = io.WriteString(f, "\n")
+	_ = f.Sync()
+}
+
 func hexDigit(b byte) int {
 	switch {
 	case b >= '0' && b <= '9':
@@ -140,7 +189,8 @@ func readInteractiveLine(tty *os.File, prompt string) (line string, cancel bool,
 		if old != nil {
 			_ = term.Restore(fd, old)
 		}
-		sttySaneOn(tty)
+		repairTTYLineDiscipline(tty)
+		announceTTYReadyForReadline(tty)
 	}()
 
 	if _, err := io.WriteString(tty, prompt); err != nil {
@@ -151,13 +201,29 @@ func readInteractiveLine(tty *os.File, prompt string) (line string, cancel bool,
 	var pending []byte
 	readBuf := make([]byte, 256)
 
-	for {
-		n, rerr := tty.Read(readBuf)
-		if n > 0 {
-			pending = append(pending, readBuf[:n]...)
+	cancelToShell := func() (string, bool, error) {
+		if old != nil {
+			_ = term.Restore(fd, old)
 		}
-		if rerr != nil && rerr != io.EOF {
-			return "", false, rerr
+		repairTTYLineDiscipline(tty)
+		writeShellRestore(tty, restoreLine)
+		announceTTYReadyForReadline(tty)
+		ttyRestored = true
+		return "", true, nil
+	}
+
+	for {
+		if len(pending) == 0 {
+			n, rerr := tty.Read(readBuf)
+			if n > 0 {
+				pending = append(pending, readBuf[:n]...)
+			}
+			if rerr != nil && rerr != io.EOF {
+				return "", false, rerr
+			}
+			if rerr == io.EOF && len(pending) == 0 {
+				return string(lineRunes), false, io.EOF
+			}
 		}
 
 		consumed, done, hotkeyCancel, cerr := processTTYInput(tty, &lineRunes, pending, hotkey)
@@ -166,23 +232,47 @@ func readInteractiveLine(tty *os.File, prompt string) (line string, cancel bool,
 			return "", false, cerr
 		}
 		if hotkeyCancel {
-			// Restore cooked mode and line discipline *before* repainting the shell line. Drawing the
-			// prompt while still raw leaves the tty out of sync with bash/readline (next Meta key may
-			// echo as ^[p instead of running bind -x).
-			if old != nil {
-				_ = term.Restore(fd, old)
-			}
-			sttySaneOn(tty)
-			writeShellRestore(tty, restoreLine)
-			ttyRestored = true
-			return "", true, nil
+			return cancelToShell()
 		}
 		if done {
 			_, _ = io.WriteString(tty, "\r\n")
 			return string(lineRunes), false, nil
 		}
-		if rerr == io.EOF && len(pending) == 0 {
-			return string(lineRunes), false, io.EOF
+
+		// Buffer is only a strict prefix of the hotkey (e.g. ESC waiting for p). Without a follow-up
+		// byte the loop would block forever; wait briefly, then treat as lone Escape = cancel.
+		if len(pending) > 0 && len(hotkey) > 1 && pending[0] == 0x1b &&
+			bytes.HasPrefix(hotkey, pending) && len(pending) < len(hotkey) {
+			n2, rerr2 := ttyReadAfterPoll(tty, readBuf, loneESCHotkeyPoll)
+			if n2 > 0 {
+				pending = append(pending, readBuf[:n2]...)
+				continue
+			}
+			if errors.Is(rerr2, io.EOF) {
+				return string(lineRunes), false, io.EOF
+			}
+			if errors.Is(rerr2, os.ErrDeadlineExceeded) || rerr2 == nil {
+				return cancelToShell()
+			}
+			return "", false, rerr2
+		}
+
+		if len(pending) == 0 {
+			continue
+		}
+		if consumed == 0 {
+			n, rerr := tty.Read(readBuf)
+			if n > 0 {
+				pending = append(pending, readBuf[:n]...)
+				continue
+			}
+			if rerr != nil && rerr != io.EOF {
+				return "", false, rerr
+			}
+			if rerr == io.EOF && len(pending) == 0 {
+				return string(lineRunes), false, io.EOF
+			}
+			continue
 		}
 	}
 }
