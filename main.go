@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"fmt"
 	"io"
 	"os"
@@ -45,7 +44,13 @@ Environment:
   OLLAMA_HOST          local server base URL (default http://127.0.0.1:11434)
   OLLAMA_MODEL         model name (default gemma4:e2b)
   OLLAMA_API_KEY       if set, uses https://ollama.com/api/generate
-  TERMINAL_AI_PROMPT   interactive prompt; placeholders %w %u %h, %% for literal % (see README)
+  TERMINAL_AI_PROMPT   app label only, e.g. TerminalAI (default). Renders as Label:path$ like user@host:path$.
+                       Legacy: if the value contains %%w, %%u, or %%h, full template mode (old behavior).
+  TERMINAL_AI_HOTKEY   raw key sequence to cancel interactive input (toggle back to shell).
+                       Go-style escapes: \\e = ESC, \\x1b, \\n, etc. Default is \\ep (Alt+P on xterm-like terminals).
+  TERMINAL_AI_SHELL_LINE  optional full line to redraw when canceling (overwrites the app prompt row; no extra newline).
+  TERMINAL_AI_EXPAND_PS1  if unset or 1, runs bash to expand PS1 (${PS1@P}) for redraw; set 0 to skip.
+  TERMINAL_AI_SPINNER_PREFIX_RUNES  legacy templates only: visible runes before [thinking] (default 12).
 `)
 }
 
@@ -93,32 +98,31 @@ func sttySaneOn(f *os.File) {
 }
 
 func runInteractive() int {
-	raw := os.Getenv("TERMINAL_AI_PROMPT")
-	var prompt string
-	if strings.TrimSpace(raw) == "" {
-		prompt = "[terminal-ai]$ "
-	} else {
-		prompt = expandPromptTemplate(raw)
-	}
+	prompt, pstyle := buildInteractivePrompt()
 
 	tty, err := openDevTTY()
-	var in io.Reader
-	var promptOut io.Writer
+	var input *os.File
 	if err == nil && tty != nil {
-		defer tty.Close()
+		defer func() {
+			sttySaneOn(tty)
+			tty.Close()
+		}()
 		sttySaneOn(tty)
-		in, promptOut = tty, tty
+		input = tty
 	} else {
 		if !term.IsTerminal(int(os.Stdin.Fd())) {
 			fmt.Fprintf(os.Stderr, "terminal-ai: stdin is not a terminal; use: terminal-ai ask ...\n")
 			return 2
 		}
+		defer func() { sttySaneOn(os.Stdin) }()
 		sttySaneOn(os.Stdin)
-		in, promptOut = os.Stdin, os.Stdout
+		input = os.Stdin
 	}
 
-	fmt.Fprint(promptOut, prompt)
-	line, err := bufio.NewReader(in).ReadString('\n')
+	line, altPCancel, err := readInteractiveLine(input, prompt)
+	if altPCancel {
+		return 0
+	}
 	if err != nil {
 		if err == io.EOF {
 			return 0
@@ -126,11 +130,12 @@ func runInteractive() int {
 		fmt.Fprintf(os.Stderr, "terminal-ai: read input: %v\n", err)
 		return 1
 	}
+	rawLine := line
 	line = strings.TrimSpace(line)
 	if line == "" {
 		return 0
 	}
-	return runQuery(line)
+	return runQuery(line, pstyle, rawLine)
 }
 
 func runAsk(argv []string) int {
@@ -143,17 +148,23 @@ func runAsk(argv []string) int {
 		}
 		query = strings.TrimSpace(string(b))
 	}
-	return runQuery(query)
+	return runQuery(query, promptStyle{AskMode: true}, "")
 }
 
-func runQuery(query string) int {
+func runQuery(query string, style promptStyle, userDisplay string) int {
 	query = strings.TrimSpace(query)
 	if query == "" {
 		fmt.Fprintln(os.Stderr, "terminal-ai: empty query")
 		return 1
 	}
 
+	stopThinking := startThinkingSpinner(style, userDisplay)
+	defer stopThinking()
+
 	cmdStr, err := shellFromNaturalLanguage(query)
+	// Stop as soon as the model returns so command output is not drawn on the spinner line.
+	stopThinking()
+
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "terminal-ai: %v\n", err)
 		return 1
@@ -176,6 +187,10 @@ func runQuery(query string) int {
 	}
 	if len(out) > 0 {
 		fmt.Printf("%s\n", out)
+	} else {
+		// Spinner clear no longer ends with \n; emit one line when the command prints nothing
+		// so the shell prompt does not share a row with the cleared thinking line.
+		fmt.Print("\n")
 	}
 	return 0
 }
